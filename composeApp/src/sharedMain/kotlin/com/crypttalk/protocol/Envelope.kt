@@ -15,3 +15,11 @@ data class Envelope(
     val nonce: String? = null,
     val ct: String? = null
 )
+
+/** 加密前的消息明文结构：发送者信息放在密文内部，解密后再校验 */
+@Serializable
+data class MessagePayload(
+    val from: String,
+    val pk: String,
+    val text: String
+)

@@ -13,6 +13,7 @@ import com.crypttalk.data.SessionRecord
 import com.crypttalk.data.Store
 import com.crypttalk.data.StoredMessage
 import com.crypttalk.protocol.Envelope
+import com.crypttalk.protocol.MessagePayload
 import com.crypttalk.protocol.Protocol
 import org.bouncycastle.math.ec.ECPoint
 import java.io.File
@@ -407,10 +408,6 @@ class AppController(private val env: AppEnvironment) {
 
     private fun decryptIncoming(contactId: String, envelope: Envelope): PasteResult {
         val contact = contact(contactId) ?: return PasteResult(error = "联系人不存在")
-        val senderPk = envelope.pk ?: return PasteResult(error = "消息缺少发送者公钥")
-        if (!senderPk.equals(contact.pkHex, ignoreCase = true)) {
-            return PasteResult(error = "消息发送者与当前联系人不一致")
-        }
         val sid = envelope.sid?.takeIf { it.isNotEmpty() }
             ?: return PasteResult(error = "消息缺少会话标识")
         val record = sessionsFor(contactId).lastOrNull { it.sid == sid }
@@ -422,7 +419,8 @@ class AppController(private val env: AppEnvironment) {
         }
 
         return try {
-            val plaintext = Protocol.decryptMessage(envelope, key)
+            val payload = Protocol.decryptMessage(envelope, key)
+            verifySender(payload, contact)?.let { return PasteResult(error = it) }
             val message = StoredMessage(
                 id = UUID.randomUUID().toString(),
                 contactId = contactId,
@@ -434,7 +432,7 @@ class AppController(private val env: AppEnvironment) {
                 seq = seq,
                 ts = now()
             )
-            messageTextCache[message.id] = plaintext
+            messageTextCache[message.id] = payload.text
             val updatedRecord = record.copy(
                 seenSeqs = (record.seenSeqs + seq).takeLast(500)
             )
@@ -444,6 +442,21 @@ class AppController(private val env: AppEnvironment) {
         } catch (e: Exception) {
             PasteResult(error = e.message ?: "解密失败")
         }
+    }
+
+    private fun verifySender(payload: MessagePayload, contact: Contact): String? {
+        val canonical = try {
+            Hex.encode(Sm2.publicKeyBytes(Sm2.decodePublicKey(Hex.decode(payload.pk))))
+        } catch (e: Exception) {
+            return "消息发送者公钥格式错误"
+        }
+        if (!canonical.equals(contact.pkHex, ignoreCase = true)) {
+            return "消息发送者与当前联系人不一致"
+        }
+        if (payload.from != contact.name) {
+            return "消息发送者与当前联系人名称不一致"
+        }
+        return null
     }
 
     fun sendMessage(contactId: String, text: String): SendResult {
@@ -493,9 +506,9 @@ class AppController(private val env: AppEnvironment) {
         if (key == null) return "［无法解密：会话密钥不可用］"
         return try {
             val envelope = Protocol.decode(message.envelope)
-            val plaintext = Protocol.decryptMessage(envelope, key)
-            messageTextCache[message.id] = plaintext
-            plaintext
+            val payload = Protocol.decryptMessage(envelope, key)
+            messageTextCache[message.id] = payload.text
+            payload.text
         } catch (e: Exception) {
             "［无法解密：${e.message ?: "数据损坏"}］"
         }

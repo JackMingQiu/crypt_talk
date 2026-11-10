@@ -118,17 +118,46 @@ class CryptoTests {
         assertContentEquals(accept.sessionKey, initiator.key)
 
         val code = Protocol.encryptMessage("alice", alicePk, accept.sid, 1, initiator.key, "你好，Bob")
-        val decrypted = Protocol.decryptMessage(Protocol.decode(code), accept.sessionKey)
-        assertEquals("你好，Bob", decrypted)
+        val envelope = Protocol.decode(code)
+        assertEquals(null, envelope.from, "消息信封不应包含 from")
+        assertEquals(null, envelope.pk, "消息信封不应包含 pk")
+        val decrypted = Protocol.decryptMessage(envelope, accept.sessionKey)
+        assertEquals("alice", decrypted.from)
+        assertEquals(Hex.encode(alicePk), decrypted.pk)
+        assertEquals("你好，Bob", decrypted.text)
 
         val wrapped = code.chunked(40).joinToString("\n")
         assertEquals(code, Protocol.encode(Protocol.decode(wrapped)))
 
-        val tampered = Protocol.decode(code).copy(ct = "AAAA")
+        val tampered = envelope.copy(ct = "AAAA")
         assertFailsWith<CryptoException> {
-            Protocol.decode(code)
             Protocol.decryptMessage(tampered, accept.sessionKey)
         }
+    }
+
+    @Test
+    fun legacyMessageEnvelopeStillDecrypts() {
+        val key = ByteArray(16) { (it * 5).toByte() }
+        val sid = "0011223344556677"
+        val from = "alice"
+        val pk = "04" + "ab".repeat(64)
+        val seq = 7L
+        val nonce = ByteArray(12) { (it * 2).toByte() }
+        val aad = "CTK1|msg|$sid|$from|$pk|$seq".toByteArray(Charsets.UTF_8)
+        val ct = Sm4.gcmEncrypt(key, nonce, "旧版明文".toByteArray(Charsets.UTF_8), aad)
+        val legacy = com.crypttalk.protocol.Envelope(
+            type = "msg",
+            from = from,
+            pk = pk,
+            sid = sid,
+            seq = seq,
+            nonce = com.crypttalk.crypto.B64.encode(nonce),
+            ct = com.crypttalk.crypto.B64.encode(ct)
+        )
+        val decrypted = Protocol.decryptMessage(legacy, key)
+        assertEquals(from, decrypted.from)
+        assertEquals(pk, decrypted.pk)
+        assertEquals("旧版明文", decrypted.text)
     }
 }
 
@@ -171,6 +200,9 @@ class AppFlowTests {
 
         val sent = alice.sendMessage(aliceToBob, "第一条加密消息")
         assertNotNull(sent.code, "加密失败：${sent.error}")
+        val sentEnvelope = Protocol.decode(sent.code!!)
+        assertEquals(null, sentEnvelope.from)
+        assertEquals(null, sentEnvelope.pk)
         val received = bob.handlePasted(bobToAlice, sent.code!!)
         assertEquals(null, received.error)
 
@@ -189,6 +221,58 @@ class AppFlowTests {
         assertEquals("PIN 错误", alice.unlock("wrong-pin"))
         assertEquals(null, alice.unlock("Aa123456!"))
         assertEquals("收到！", alice.messageText(alice.messagesFor(aliceToBob).last()))
+    }
+
+    @Test
+    fun incomingMessageWithWrongInnerIdentityIsRejected() {
+        val aliceDir = tempDir()
+        val bobDir = tempDir()
+        val alice = controller(aliceDir)
+        val bob = controller(bobDir)
+
+        assertNullError(alice.setup("alice", "Aa123456!", "Aa123456!"))
+        assertNullError(bob.setup("bob", "Bb123456!", "Bb123456!"))
+        assertNullError(alice.addContact("bob", bob.myPkHex))
+        assertNullError(bob.addContact("alice", alice.myPkHex))
+
+        val aliceToBob = alice.contacts.single().id
+        val bobToAlice = bob.contacts.single().id
+        val invite = alice.startSession(aliceToBob)
+        val accept = bob.handlePasted(bobToAlice, invite.inviteCode!!)
+        assertEquals(null, alice.handlePasted(aliceToBob, accept.replyCode!!).error)
+
+        val bobRecord = bob.sessionsFor(bobToAlice).single { it.status == "active" }
+        val bobProfile = com.crypttalk.data.Store(bobDir).loadProfile()!!
+        val bobKey = PinCipher.decrypt(
+            PinCipher.deriveEncKey("Bb123456!", bobProfile.unix),
+            bobRecord.keyEnc,
+            PinCipher.SESSION_KEY_AAD
+        )
+
+        val mallory = Sm2.generateKeyPair()
+        val forgedPk = Protocol.encryptMessage(
+            "mallory",
+            Sm2.publicKeyBytes(mallory.q),
+            bobRecord.sid,
+            1,
+            bobKey,
+            "伪造消息"
+        )
+        val forgedResult = bob.handlePasted(bobToAlice, forgedPk)
+        assertEquals("消息发送者与当前联系人不一致", forgedResult.error)
+
+        val forgedName = Protocol.encryptMessage(
+            "alice2",
+            Hex.decode(alice.myPkHex),
+            bobRecord.sid,
+            1,
+            bobKey,
+            "伪造消息"
+        )
+        val nameResult = bob.handlePasted(bobToAlice, forgedName)
+        assertEquals("消息发送者与当前联系人名称不一致", nameResult.error)
+
+        assertEquals(0, bob.messagesFor(bobToAlice).count { it.kind == "text" })
     }
 
     private fun assertNullError(error: String?) {

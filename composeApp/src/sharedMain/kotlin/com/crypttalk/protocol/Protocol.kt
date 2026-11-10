@@ -181,13 +181,18 @@ object Protocol {
     ): String {
         val nonce = ByteArray(Sm4.NONCE_SIZE)
         random.nextBytes(nonce)
-        val pkHex = Hex.encode(identityPk)
-        val aad = messageAad(sid, name, pkHex, seq)
-        val ciphertext = Sm4.gcmEncrypt(sessionKey, nonce, plaintext.toByteArray(Charsets.UTF_8), aad)
+        val payload = json.encodeToString(
+            MessagePayload.serializer(),
+            MessagePayload(from = name, pk = Hex.encode(identityPk), text = plaintext)
+        )
+        val ciphertext = Sm4.gcmEncrypt(
+            sessionKey,
+            nonce,
+            payload.toByteArray(Charsets.UTF_8),
+            messageAad(sid, seq)
+        )
         val envelope = Envelope(
             type = TYPE_MESSAGE,
-            from = name,
-            pk = pkHex,
             sid = sid,
             seq = seq,
             nonce = B64.encode(nonce),
@@ -196,20 +201,33 @@ object Protocol {
         return encode(envelope)
     }
 
-    fun decryptMessage(envelope: Envelope, sessionKey: ByteArray): String {
+    fun decryptMessage(envelope: Envelope, sessionKey: ByteArray): MessagePayload {
         if (envelope.type != TYPE_MESSAGE) throw CryptoException("这不是聊天消息")
         val sid = requiredField(envelope.sid, "会话标识")
         val nonce = B64.decode(requiredField(envelope.nonce, "随机数"))
         val ciphertext = B64.decode(requiredField(envelope.ct, "密文"))
-        val from = requiredField(envelope.from, "发送者")
-        val pk = requiredField(envelope.pk, "公钥")
         val seq = envelope.seq ?: throw CryptoException("消息缺少序号")
-        val aad = messageAad(sid, from, pk, seq)
-        val plaintext = Sm4.gcmDecrypt(sessionKey, nonce, ciphertext, aad)
-        return String(plaintext, Charsets.UTF_8)
+
+        // 兼容旧版信封：from/pk 在信封中、AAD 含发送者信息、明文为纯文本
+        if (envelope.from != null || envelope.pk != null) {
+            val from = requiredField(envelope.from, "发送者")
+            val pk = requiredField(envelope.pk, "公钥")
+            val plaintext = Sm4.gcmDecrypt(sessionKey, nonce, ciphertext, legacyMessageAad(sid, from, pk, seq))
+            return MessagePayload(from = from, pk = pk, text = String(plaintext, Charsets.UTF_8))
+        }
+
+        val plaintext = Sm4.gcmDecrypt(sessionKey, nonce, ciphertext, messageAad(sid, seq))
+        return try {
+            json.decodeFromString(MessagePayload.serializer(), String(plaintext, Charsets.UTF_8))
+        } catch (e: Exception) {
+            throw CryptoException("消息明文格式不正确", e)
+        }
     }
 
-    private fun messageAad(sid: String, from: String, pkHex: String, seq: Long): ByteArray =
+    private fun messageAad(sid: String, seq: Long): ByteArray =
+        "CTK1|$TYPE_MESSAGE|$sid|$seq".toByteArray(Charsets.UTF_8)
+
+    private fun legacyMessageAad(sid: String, from: String, pkHex: String, seq: Long): ByteArray =
         "CTK1|$TYPE_MESSAGE|$sid|$from|$pkHex|$seq".toByteArray(Charsets.UTF_8)
 
     private fun requiredField(value: String?, name: String): String =
